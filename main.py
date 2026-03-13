@@ -9,6 +9,8 @@ Connects to a private ESPN fantasy basketball league and displays:
 import os
 import sys
 from dotenv import load_dotenv
+import espn_api.requests.constant as espn_constant
+espn_constant.FANTASY_BASE_ENDPOINT = 'https://lm-api-reads.fantasy.espn.com/apis/v3/games/'
 from espn_api.basketball import League
 from tabulate import tabulate
 
