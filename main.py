@@ -91,36 +91,48 @@ def show_standings(league: League) -> None:
 
 
 def _get_current_matchup_period(league: League) -> int:
-    """Return the matchup period that contains the current scoring period.
-    Falls back to currentMatchupPeriod if detection fails."""
+    """Return the actual current matchup period by scanning the schedule for
+    undecided matchups.  Falls back to league.currentMatchupPeriod."""
+    # Cache result so we only make the API call once per session
+    cached = getattr(league, '_current_mp_cache', None)
+    if cached is not None:
+        return cached
+
     # matchup_ids is populated for H2H points leagues; may be empty for H2H category
     if league.matchup_ids:
         sp = str(league.scoringPeriodId)
         for mp, periods in league.matchup_ids.items():
             if sp in [str(p) for p in periods]:
+                league._current_mp_cache = mp
                 return mp
-    return league.currentMatchupPeriod
+
+    # For H2H category leagues: fetch the schedule and find undecided matchups
+    try:
+        data = league.espn_request.league_get(params={'view': 'mMatchup'})
+        schedule = data.get('schedule', [])
+        undecided = {
+            m['matchupPeriodId'] for m in schedule
+            if m.get('winner') == 'UNDECIDED' and 'matchupPeriodId' in m
+        }
+        if undecided:
+            mp = min(undecided)
+            league._current_mp_cache = mp
+            return mp
+    except Exception:
+        pass
+
+    mp = league.currentMatchupPeriod
+    league._current_mp_cache = mp
+    return mp
 
 
 def _box_scores_for_current_week(league: League):
-    """Return box scores for the actual current week.
-    If currentMatchupPeriod points to a completed week, tries the next one."""
-    scores = league.box_scores()
-    # If every matchup is already decided, the current period is likely over —
-    # try the next matchup period (handles ESPN lag on currentMatchupPeriod)
-    if scores and all(
-        getattr(bs, 'winner', 'UNDECIDED') not in ('UNDECIDED', '')
-        for bs in scores
-    ):
-        try:
-            next_scores = league.box_scores(
-                matchup_period=league.currentMatchupPeriod + 1
-            )
-            if next_scores:
-                return next_scores
-        except Exception:
-            pass
-    return scores
+    """Return box scores for the actual current week."""
+    current_mp = _get_current_matchup_period(league)
+    return league.box_scores(
+        matchup_period=current_mp,
+        scoring_period=league.scoringPeriodId,
+    )
 
 
 def show_scoreboard(league: League) -> None:
@@ -200,21 +212,33 @@ def _pct(makes: float, attempts: float) -> float:
     return round(makes / attempts * 100, 1) if attempts else 0.0
 
 
+def _get_pro_schedule(league: League) -> dict:
+    """Return {proTeamId: {period_str: [games]}} — cached on the league object."""
+    cached = getattr(league, '_pro_sched_cache', None)
+    if cached is not None:
+        return cached
+    # Newer espn_api versions expose league.pro_schedule; older ones don't
+    if hasattr(league, 'pro_schedule'):
+        league._pro_sched_cache = league.pro_schedule
+        return league.pro_schedule
+    raw = league.espn_request.get_pro_schedule()
+    sched = {
+        t['id']: t.get('proGamesByScoringPeriod', {})
+        for t in raw.get('settings', {}).get('proTeams', [])
+    }
+    league._pro_sched_cache = sched
+    return sched
+
+
 def _get_remaining_games(league: League) -> dict:
-    """Return {proTeamId: games_remaining_this_matchup_week}.
-    Uses league.pro_schedule (already loaded at startup)."""
+    """Return {proTeamId: games_remaining_this_matchup_week}."""
     current_period = league.scoringPeriodId
 
     # Determine the last scoring period of the current matchup week
     end_period = current_period + 6  # safe fallback (~1 week of daily periods)
     try:
         if league.matchup_ids:
-            # Find the matchup period that contains the current scoring period
-            current_mp = league.currentMatchupPeriod
-            for mp, periods in league.matchup_ids.items():
-                if str(current_period) in [str(p) for p in periods]:
-                    current_mp = mp
-                    break
+            current_mp = _get_current_matchup_period(league)
             periods = league.matchup_ids.get(current_mp, [])
             if periods:
                 end_period = max(int(p) for p in periods)
@@ -222,14 +246,15 @@ def _get_remaining_games(league: League) -> dict:
             # H2H category: try settings.matchup_periods
             mp_map = getattr(league.settings, 'matchup_periods', {})
             if mp_map:
-                periods = mp_map.get(league.currentMatchupPeriod, [])
+                periods = mp_map.get(_get_current_matchup_period(league), [])
                 if periods:
                     end_period = max(int(p) for p in periods)
     except Exception:
         pass
 
+    pro_sched = _get_pro_schedule(league)
     remaining = {}
-    for pro_id, schedule in league.pro_schedule.items():
+    for pro_id, schedule in pro_sched.items():
         if pro_id == 0:
             continue
         count = 0
