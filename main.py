@@ -85,19 +85,19 @@ def show_scoreboard(league: League) -> None:
     for matchup in box_scores:
         home = matchup.home_team
         away = matchup.away_team
-        home_score = round(matchup.home_score, 1) if matchup.home_score else 0.0
-        away_score = round(matchup.away_score, 1) if matchup.away_score else 0.0
-        rows.append([
-            home.team_name,
-            home_score,
-            "vs",
-            away_score,
-            away.team_name,
-        ])
+        if hasattr(matchup, 'home_score'):
+            home_score = round(matchup.home_score, 1) if matchup.home_score else 0.0
+            away_score = round(matchup.away_score, 1) if matchup.away_score else 0.0
+            score_str = f"{home_score} - {away_score}"
+        elif hasattr(matchup, 'home_wins'):
+            score_str = f"{matchup.home_wins}-{matchup.home_losses}-{matchup.home_ties} vs {matchup.away_wins}-{matchup.away_losses}-{matchup.away_ties}"
+        else:
+            score_str = "In progress"
+        rows.append([home.team_name, score_str, away.team_name])
 
     print(tabulate(
         rows,
-        headers=["Home Team", "Home Pts", "", "Away Pts", "Away Team"],
+        headers=["Home Team", "Score (W-L-T)", "Away Team"],
         tablefmt="simple",
     ))
 
