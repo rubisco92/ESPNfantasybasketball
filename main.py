@@ -306,6 +306,34 @@ def show_my_matchup(league: League) -> None:
     opp_lineup = my_bs.away_lineup if i_am_home else my_bs.home_lineup
     opp_team   = my_bs.away_team   if i_am_home else my_bs.home_team
 
+    # ── DEBUG: print raw data to understand structure ─────────────────────
+    if my_lineup:
+        p = my_lineup[0]
+        print(f"\n  [DEBUG] First player: {p.name}")
+        print(f"  [DEBUG] slot_position: {p.slot_position}")
+        print(f"  [DEBUG] proTeam: {getattr(p, 'proTeam', 'N/A')}")
+        print(f"  [DEBUG] stats keys (first 10): {list((p.stats or {}).keys())[:10]}")
+        print(f"  [DEBUG] stats sample: {dict(list((p.stats or {}).items())[:5])}")
+        print(f"  [DEBUG] all attributes: {[a for a in dir(p) if not a.startswith('_')]}")
+
+    try:
+        sched_data = league.espn_request.get_pro_schedule()
+        settings = sched_data.get('settings', {})
+        print(f"\n  [DEBUG] pro schedule top-level keys: {list(sched_data.keys())}")
+        print(f"  [DEBUG] settings keys: {list(settings.keys())[:10]}")
+        pro_teams = settings.get('proTeams', [])
+        if pro_teams:
+            t0 = pro_teams[0]
+            print(f"  [DEBUG] first proTeam keys: {list(t0.keys())}")
+            pbsp = t0.get('proGamesByScoringPeriod', {})
+            print(f"  [DEBUG] proGamesByScoringPeriod sample keys: {list(pbsp.keys())[:5]}")
+            print(f"  [DEBUG] current scoringPeriodId: {league.scoringPeriodId}")
+    except Exception as ex:
+        print(f"  [DEBUG] pro schedule error: {ex}")
+
+    input("\n  [DEBUG] Press Enter to continue...")
+    # ── END DEBUG ─────────────────────────────────────────────────────────
+
     # ── SECTION 1: Current Category Scores ───────────────────────────────
     print(f"\n  Opponent: {opp_team.team_name}")
     print(f"\n  {'─' * 68}")
