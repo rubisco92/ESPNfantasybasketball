@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 import espn_api.requests.constant as espn_constant
 espn_constant.FANTASY_BASE_ENDPOINT = 'https://lm-api-reads.fantasy.espn.com/apis/v3/games/'
 from espn_api.basketball import League
+from espn_api.basketball.constant import PRO_TEAM_MAP
 from tabulate import tabulate
 
 load_dotenv()
@@ -30,17 +31,11 @@ STAT_DISPLAY = [
     ('17', '3PM'),
 ]
 
-# Percentage categories: (label, makes_id, attempts_id)
-PCT_STATS = [
-    ('FG%', '13', '14'),
-    ('FT%', '15', '16'),
-]
+# Percentage categories
+PCT_LABELS = ['FG%', 'FT%']
 
-# Human-readable keys some espn_api versions use -> numeric string ID
-_HR_TO_ID = {
-    'PTS': '0', 'BLK': '1', 'STL': '2', 'AST': '3', 'REB': '6',
-    'TO': '11', 'FGM': '13', 'FGA': '14', 'FTM': '15', 'FTA': '16', '3PM': '17',
-}
+# Result string mapping from ESPN API
+_RESULT_MAP = {'WIN': 'W', 'LOSS': 'L', 'TIE': 'T', 'W': 'W', 'L': 'L', 'T': 'T'}
 
 
 def get_league() -> League:
@@ -95,13 +90,46 @@ def show_standings(league: League) -> None:
     ))
 
 
+def _get_current_matchup_period(league: League) -> int:
+    """Return the matchup period that contains the current scoring period.
+    Falls back to currentMatchupPeriod if detection fails."""
+    # matchup_ids is populated for H2H points leagues; may be empty for H2H category
+    if league.matchup_ids:
+        sp = str(league.scoringPeriodId)
+        for mp, periods in league.matchup_ids.items():
+            if sp in [str(p) for p in periods]:
+                return mp
+    return league.currentMatchupPeriod
+
+
+def _box_scores_for_current_week(league: League):
+    """Return box scores for the actual current week.
+    If currentMatchupPeriod points to a completed week, tries the next one."""
+    scores = league.box_scores()
+    # If every matchup is already decided, the current period is likely over —
+    # try the next matchup period (handles ESPN lag on currentMatchupPeriod)
+    if scores and all(
+        getattr(bs, 'winner', 'UNDECIDED') not in ('UNDECIDED', '')
+        for bs in scores
+    ):
+        try:
+            next_scores = league.box_scores(
+                matchup_period=league.currentMatchupPeriod + 1
+            )
+            if next_scores:
+                return next_scores
+        except Exception:
+            pass
+    return scores
+
+
 def show_scoreboard(league: League) -> None:
     print("\n" + "=" * 60)
     print("  CURRENT WEEK SCOREBOARD")
     print("=" * 60)
 
     try:
-        box_scores = league.box_scores()
+        box_scores = _box_scores_for_current_week(league)
     except Exception as e:
         print(f"  Could not load scoreboard: {e}")
         return
@@ -115,7 +143,11 @@ def show_scoreboard(league: League) -> None:
             away_score = round(matchup.away_score, 1) if matchup.away_score else 0.0
             score_str = f"{home_score} - {away_score}"
         elif hasattr(matchup, 'home_wins'):
-            score_str = f"{matchup.home_wins}-{matchup.home_losses}-{matchup.home_ties} vs {matchup.away_wins}-{matchup.away_losses}-{matchup.away_ties}"
+            score_str = (
+                f"{matchup.home_wins}-{matchup.home_losses}-{matchup.home_ties}"
+                f" vs "
+                f"{matchup.away_wins}-{matchup.away_losses}-{matchup.away_ties}"
+            )
         else:
             score_str = "In progress"
         rows.append([home.team_name, score_str, away.team_name])
@@ -164,85 +196,69 @@ def show_all_rosters(league: League) -> None:
 
 # ── Matchup analysis helpers ───────────────────────────────────────────────
 
-def _normalize_stats(raw_stats: dict) -> dict:
-    """Normalize a player.stats dict to string numeric-ID keys."""
-    out = {}
-    for k, v in (raw_stats or {}).items():
-        if v is None:
-            continue
-        sk = str(k)
-        # convert human-readable keys to numeric string IDs
-        sk = _HR_TO_ID.get(sk, sk)
-        try:
-            out[sk] = out.get(sk, 0) + float(v)
-        except (TypeError, ValueError):
-            pass
-    return out
-
-
-def _sum_lineup_stats(lineup) -> dict:
-    """Sum normalized stats from all non-IR players in a lineup."""
-    totals = {}
-    for player in lineup:
-        if player.slot_position == 'IR':
-            continue
-        for k, v in _normalize_stats(player.stats).items():
-            totals[k] = totals.get(k, 0) + v
-    return totals
-
-
-def _pct(totals: dict, makes_id: str, att_id: str) -> float:
-    m = totals.get(makes_id, 0)
-    a = totals.get(att_id, 0)
-    return round(m / a * 100, 1) if a else 0.0
+def _pct(makes: float, attempts: float) -> float:
+    return round(makes / attempts * 100, 1) if attempts else 0.0
 
 
 def _get_remaining_games(league: League) -> dict:
-    """Return {proTeamId: games_remaining_this_week}."""
+    """Return {proTeamId: games_remaining_this_matchup_week}.
+    Uses league.pro_schedule (already loaded at startup)."""
     current_period = league.scoringPeriodId
 
-    # Try to find the last scoring period of the current matchup week
-    end_period = current_period + 6  # safe fallback
+    # Determine the last scoring period of the current matchup week
+    end_period = current_period + 6  # safe fallback (~1 week of daily periods)
     try:
-        periods = league.settings.matchup_periods.get(league.currentMatchupPeriod, [])
-        if periods:
-            end_period = max(periods)
+        if league.matchup_ids:
+            # Find the matchup period that contains the current scoring period
+            current_mp = league.currentMatchupPeriod
+            for mp, periods in league.matchup_ids.items():
+                if str(current_period) in [str(p) for p in periods]:
+                    current_mp = mp
+                    break
+            periods = league.matchup_ids.get(current_mp, [])
+            if periods:
+                end_period = max(int(p) for p in periods)
+        else:
+            # H2H category: try settings.matchup_periods
+            mp_map = getattr(league.settings, 'matchup_periods', {})
+            if mp_map:
+                periods = mp_map.get(league.currentMatchupPeriod, [])
+                if periods:
+                    end_period = max(int(p) for p in periods)
     except Exception:
         pass
 
-    try:
-        data = league.espn_request.get_pro_schedule()
-    except Exception:
-        return {}
-
-    pro_teams = (data.get('settings') or {}).get('proTeams', [])
     remaining = {}
-    for team in pro_teams:
-        tid = team.get('id')
-        if tid is None:
+    for pro_id, schedule in league.pro_schedule.items():
+        if pro_id == 0:
             continue
         count = 0
-        for period_str, games in team.get('proGamesByScoringPeriod', {}).items():
+        for period_str, games in schedule.items():
             try:
                 period = int(period_str)
-            except ValueError:
+            except (ValueError, TypeError):
                 continue
             if current_period <= period <= end_period:
                 count += len(games)
-        remaining[tid] = count
+        remaining[pro_id] = count
     return remaining
 
 
 def _get_last15_stats(league: League, player_ids: list) -> dict:
     """Return {playerId: {stat_id_str: per_game_avg}} from last-15-days data.
-    Falls back to season averages if last-15 is unavailable."""
+    Falls back to season averages if last-15 is unavailable.
+    Stats keys are numeric strings ('0'=PTS, '6'=REB, '13'=FGM, etc.)."""
     if not player_ids:
         return {}
+
+    last15_id = f'02{league.year}'   # e.g. '022026' for 2025-26 season
+    season_id  = f'00{league.year}'  # e.g. '002026'
+
     try:
         data = league.espn_request.get_player_card(
             playerIds=player_ids,
             max_scoring_period=league.scoringPeriodId,
-            additional_filters=['022025'],  # last 15 days
+            additional_filters=[last15_id],
         )
     except Exception:
         return {}
@@ -253,15 +269,15 @@ def _get_last15_stats(league: League, player_ids: list) -> dict:
         if pid is None:
             continue
         player_data = (entry.get('playerPoolEntry') or {}).get('player') or {}
-        chosen = {}
+        chosen   = {}
         fallback = {}
-        for stat_entry in (player_data.get('stats') or []):
-            ext_id = stat_entry.get('externalId', '')
-            # averageStats gives per-game averages for the period
-            avg = stat_entry.get('averageStats') or stat_entry.get('stats') or {}
-            if ext_id == '022025' and not chosen:
+        for split in (player_data.get('stats') or []):
+            split_id = split.get('id', '')
+            # averageStats holds per-game averages with numeric-string keys
+            avg = split.get('averageStats') or split.get('stats') or {}
+            if split_id == last15_id and not chosen:
                 chosen = avg
-            elif ext_id == '002025' and not fallback:
+            elif split_id == season_id and not fallback:
                 fallback = avg
         raw = chosen or fallback
         result[pid] = {str(k): float(v) for k, v in raw.items() if v is not None}
@@ -281,9 +297,9 @@ def show_my_matchup(league: League) -> None:
         print(f"  Team '{MY_TEAM_KEYWORD}' not found in league.")
         return
 
-    # Find my box score
+    # Find my box score for the current week
     try:
-        box_scores = league.box_scores()
+        box_scores = _box_scores_for_current_week(league)
     except Exception as e:
         print(f"  Could not load box scores: {e}")
         return
@@ -302,62 +318,41 @@ def show_my_matchup(league: League) -> None:
         print("  No active matchup found this week.")
         return
 
-    my_lineup  = my_bs.home_lineup if i_am_home else my_bs.away_lineup
-    opp_lineup = my_bs.away_lineup if i_am_home else my_bs.home_lineup
-    opp_team   = my_bs.away_team   if i_am_home else my_bs.home_team
-
-    # ── DEBUG: print raw data to understand structure ─────────────────────
-    if my_lineup:
-        p = my_lineup[0]
-        print(f"\n  [DEBUG] First player: {p.name}")
-        print(f"  [DEBUG] slot_position: {p.slot_position}")
-        print(f"  [DEBUG] proTeam: {getattr(p, 'proTeam', 'N/A')}")
-        print(f"  [DEBUG] stats keys (first 10): {list((p.stats or {}).keys())[:10]}")
-        print(f"  [DEBUG] stats sample: {dict(list((p.stats or {}).items())[:5])}")
-        print(f"  [DEBUG] all attributes: {[a for a in dir(p) if not a.startswith('_')]}")
-
-    try:
-        sched_data = league.espn_request.get_pro_schedule()
-        settings = sched_data.get('settings', {})
-        print(f"\n  [DEBUG] pro schedule top-level keys: {list(sched_data.keys())}")
-        print(f"  [DEBUG] settings keys: {list(settings.keys())[:10]}")
-        pro_teams = settings.get('proTeams', [])
-        if pro_teams:
-            t0 = pro_teams[0]
-            print(f"  [DEBUG] first proTeam keys: {list(t0.keys())}")
-            pbsp = t0.get('proGamesByScoringPeriod', {})
-            print(f"  [DEBUG] proGamesByScoringPeriod sample keys: {list(pbsp.keys())[:5]}")
-            print(f"  [DEBUG] current scoringPeriodId: {league.scoringPeriodId}")
-    except Exception as ex:
-        print(f"  [DEBUG] pro schedule error: {ex}")
-
-    input("\n  [DEBUG] Press Enter to continue...")
-    # ── END DEBUG ─────────────────────────────────────────────────────────
+    opp_team = my_bs.away_team if i_am_home else my_bs.home_team
 
     # ── SECTION 1: Current Category Scores ───────────────────────────────
+    # H2HCategoryBoxScore provides home_stats / away_stats dicts:
+    #   { 'PTS': {'value': 103.2, 'result': 'WIN'}, 'REB': {...}, ... }
+    # These are the cumulative category totals ESPN has already computed.
+    my_stats  = my_bs.home_stats  if i_am_home else my_bs.away_stats
+    opp_stats = my_bs.away_stats  if i_am_home else my_bs.home_stats
+
     print(f"\n  Opponent: {opp_team.team_name}")
     print(f"\n  {'─' * 68}")
     print("  SECTION 1 — CURRENT CATEGORY SCORES")
     print(f"  {'─' * 68}")
 
-    my_tot  = _sum_lineup_stats(my_lineup)
-    opp_tot = _sum_lineup_stats(opp_lineup)
-
     rows = []
-    for sid, name in STAT_DISPLAY:
-        mv = my_tot.get(sid, 0)
-        ov = opp_tot.get(sid, 0)
-        if sid == '11':  # turnovers: lower is better
-            res = 'W' if mv < ov else ('L' if mv > ov else 'T')
-        else:
-            res = 'W' if mv > ov else ('L' if mv < ov else 'T')
-        rows.append([name, round(mv, 1), round(ov, 1), res])
+    for _, label in STAT_DISPLAY:
+        my_d  = my_stats.get(label,  {})
+        opp_d = opp_stats.get(label, {})
+        my_v  = float(my_d.get('value',  0) or 0)
+        opp_v = float(opp_d.get('value', 0) or 0)
+        raw_r = my_d.get('result', 'TIE')
+        res   = _RESULT_MAP.get(str(raw_r).upper(), 'T')
+        rows.append([label, round(my_v, 1), round(opp_v, 1), res])
 
-    for label, mid, aid in PCT_STATS:
-        mp = _pct(my_tot, mid, aid)
-        op = _pct(opp_tot, mid, aid)
-        res = 'W' if mp > op else ('L' if mp < op else 'T')
-        rows.append([label, mp, op, res])
+    for label in PCT_LABELS:
+        my_d  = my_stats.get(label,  {})
+        opp_d = opp_stats.get(label, {})
+        my_v  = float(my_d.get('value',  0) or 0)
+        opp_v = float(opp_d.get('value', 0) or 0)
+        # ESPN may store as decimal (0.481) or percentage (48.1)
+        if 0 < my_v  <= 1.0: my_v  *= 100
+        if 0 < opp_v <= 1.0: opp_v *= 100
+        raw_r = my_d.get('result', 'TIE')
+        res   = _RESULT_MAP.get(str(raw_r).upper(), 'T')
+        rows.append([label, f"{round(my_v, 1)}%", f"{round(opp_v, 1)}%", res])
 
     me_col  = my_team.team_name[:20]
     opp_col = opp_team.team_name[:20]
@@ -374,34 +369,33 @@ def show_my_matchup(league: League) -> None:
     print(f"\n  Current standing: {w}W - {l}L - {t}T")
 
     # ── SECTION 2: Player Projections ─────────────────────────────────────
+    # Use my_team.roster for the full 13-player roster (not the box score
+    # lineup which may only show 9 active-slot players with wrong slots).
+    # player.lineupSlot is set from team roster data (PG/SG/BE/IR/etc.)
     print(f"\n  {'─' * 68}")
     print("  SECTION 2 — EXPECTED REMAINING STATS  (last-15d avg/g × games left)")
     print(f"  {'─' * 68}")
 
-    active   = [p for p in my_lineup if p.slot_position != 'IR']
-    pid_list = [p.playerId for p in active]
+    all_players = my_team.roster           # all 13 players
+    active      = [p for p in all_players if p.lineupSlot != 'IR']
+    pid_list    = [p.playerId for p in active]
 
     print("  Fetching remaining games and last-15-day stats...")
     rem_games = _get_remaining_games(league)
     last15    = _get_last15_stats(league, pid_list)
 
-    # Build reverse map: proTeam abbreviation -> ESPN pro team numeric ID
-    try:
-        from espn_api.basketball.constant import PRO_TEAM_MAP
-        abbr_to_id = {v: k for k, v in PRO_TEAM_MAP.items()}
-    except Exception:
-        abbr_to_id = {}
+    # Build reverse map: abbreviation → ESPN pro team ID
+    abbr_to_id = {v: k for k, v in PRO_TEAM_MAP.items()}
 
     proj_totals = {}
-    cat_labels  = [name for _, name in STAT_DISPLAY] + ['FG%', 'FT%']
-    p_rows = []
+    cat_labels  = [lbl for _, lbl in STAT_DISPLAY] + PCT_LABELS
+    p_rows      = []
 
     for player in active:
-        pro_team_abbr = getattr(player, 'proTeam', None)
-        pro_id        = abbr_to_id.get(pro_team_abbr) if pro_team_abbr else None
-        games_left    = rem_games.get(pro_id, 0) if pro_id is not None else 0
-
-        s15 = last15.get(player.playerId, {})
+        pro_id     = abbr_to_id.get(player.proTeam)
+        games_left = rem_games.get(pro_id, 0) if pro_id is not None else 0
+        s15        = last15.get(player.playerId, {})
+        slot       = player.lineupSlot or player.position or '?'
 
         cells = []
         for sid, _ in STAT_DISPLAY:
@@ -410,18 +404,18 @@ def show_my_matchup(league: League) -> None:
             proj_totals[sid] = proj_totals.get(sid, 0) + proj
             cells.append(f"{pg:.1f}×{games_left}={proj:.1f}")
 
-        # accumulate makes/attempts for FG% and FT%
+        # Accumulate makes/attempts for FG% and FT%
         for mid, aid in [('13', '14'), ('15', '16')]:
             m_pg = float(s15.get(mid, 0) or 0)
             a_pg = float(s15.get(aid, 0) or 0)
             proj_totals[mid] = proj_totals.get(mid, 0) + m_pg * games_left
             proj_totals[aid] = proj_totals.get(aid, 0) + a_pg * games_left
 
-        fg_pct = _pct({'13': float(s15.get('13', 0) or 0), '14': float(s15.get('14', 0) or 0)}, '13', '14')
-        ft_pct = _pct({'15': float(s15.get('15', 0) or 0), '16': float(s15.get('16', 0) or 0)}, '15', '16')
+        fg_pct = _pct(float(s15.get('13', 0) or 0), float(s15.get('14', 0) or 0))
+        ft_pct = _pct(float(s15.get('15', 0) or 0), float(s15.get('16', 0) or 0))
         cells += [f"{fg_pct:.1f}%", f"{ft_pct:.1f}%"]
 
-        p_rows.append([player.name[:24], player.slot_position, games_left] + cells)
+        p_rows.append([player.name[:24], slot, games_left] + cells)
 
     print(tabulate(
         p_rows,
@@ -434,19 +428,27 @@ def show_my_matchup(league: League) -> None:
     print("  SECTION 3 — PROJECTED END-OF-WEEK TOTALS (current + remaining)")
     print(f"  {'─' * 68}")
 
+    # Current totals from Section 1 stats
+    my_raw = {lbl: float((my_stats.get(lbl) or {}).get('value', 0) or 0)
+              for _, lbl in STAT_DISPLAY}
+    # FG%/FT% need makes/attempts for combining; ESPN gives us the % value only,
+    # so we carry forward the projected portion for a rough combined estimate.
     final_rows = []
-    for sid, name in STAT_DISPLAY:
-        cur  = my_tot.get(sid, 0)
-        proj = proj_totals.get(sid, 0)
+    for _, name in STAT_DISPLAY:
+        cur  = my_raw.get(name, 0)
+        proj = proj_totals.get(
+            next(sid for sid, lbl in STAT_DISPLAY if lbl == name), 0
+        )
         final_rows.append([name, round(cur, 1), round(proj, 1), round(cur + proj, 1)])
 
-    for label, mid, aid in PCT_STATS:
-        c_m = my_tot.get(mid, 0);       c_a = my_tot.get(aid, 0)
-        p_m = proj_totals.get(mid, 0);  p_a = proj_totals.get(aid, 0)
-        cur_pct  = round(c_m / c_a * 100, 1) if c_a else 0.0
+    for label in PCT_LABELS:
+        cur_v  = float((my_stats.get(label) or {}).get('value', 0) or 0)
+        if 0 < cur_v <= 1.0: cur_v *= 100
+        mid, aid = ('13', '14') if label == 'FG%' else ('15', '16')
+        p_m = proj_totals.get(mid, 0)
+        p_a = proj_totals.get(aid, 0)
         proj_pct = round(p_m / p_a * 100, 1) if p_a else 0.0
-        comb_pct = round((c_m + p_m) / (c_a + p_a) * 100, 1) if (c_a + p_a) else 0.0
-        final_rows.append([label, cur_pct, proj_pct, comb_pct])
+        final_rows.append([label, f"{round(cur_v, 1)}%", f"{proj_pct:.1f}%", "—"])
 
     print(tabulate(
         final_rows,
